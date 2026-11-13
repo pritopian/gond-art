@@ -66,6 +66,14 @@ const THEMES = {
     '#C2261E': '#E88A2E', '#E0622A': '#F0B429' } }
 };
 let theme = THEMES.earth;
+// a colour table part way between two themes, for a gradual change of the whole scene
+function blendThemes(A, B, k) {
+  const hex = h => [parseInt(h.slice(1, 3), 16), parseInt(h.slice(3, 5), 16), parseInt(h.slice(5, 7), 16)];
+  const toHex = c => '#' + c.map(v => Math.round(Math.max(0, Math.min(255, v))).toString(16).padStart(2, '0')).join('').toUpperCase();
+  const keys = new Set([...Object.keys(A.map), ...Object.keys(B.map)]), map = {};
+  for (const key of keys) { const a = hex(A.map[key] || key), b = hex(B.map[key] || key); map[key] = toHex(a.map((v, i) => v + (b[i] - v) * k)); }
+  return { name: 'blend', map };
+}
 function themed(v) { return typeof v === 'string' && v.length === 7 ? (theme.map[v.toUpperCase()] || v) : v; }
 function themeContext(c) {                                 // route every colour set on this context through the theme table
   const P = CanvasRenderingContext2D.prototype;
@@ -1599,6 +1607,7 @@ function render(t) {
 }
 
 let T = 0, last = 0;
+window.gondTheme = (from, to, k) => { theme = blendThemes(THEMES[from], THEMES[to], k); resize(); };
 window.gondRender = v => { T = ((v % LOOP) + LOOP) % LOOP; render(T); };
 window.gondTime = (n = 20) => { const t0 = performance.now(); for (let i = 0; i < n; i++) render((i * 1.2) % LOOP); return (performance.now() - t0) / n; };
 window.gondSeek = v => { T = ((v % LOOP) + LOOP) % LOOP; dirty = true; };   // jump to a moment in the loop (seconds)
