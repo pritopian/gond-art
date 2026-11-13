@@ -1,0 +1,501 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Gond Scene — p5.brush</title>
+<script src="https://cdn.jsdelivr.net/npm/p5@2/lib/p5.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/p5.brush@3"></script>
+<style>
+  html, body { margin: 0; height: 100%; background: #1c1512; }
+  body { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; font: 13px ui-sans-serif, system-ui, sans-serif; color: #cbb39c; }
+  canvas { display: block; box-shadow: 0 8px 34px rgba(0,0,0,.5); }
+  main { display: flex; flex-direction: column; align-items: center; gap: 10px; }
+  .bar { display: flex; gap: 8px; align-items: center; }
+  button { font: inherit; color: #ecd9c4; background: #33271f; border: 1px solid #5a4638; border-radius: 999px; padding: 6px 14px; cursor: pointer; min-width: 74px; }
+  button[aria-pressed="true"] { background: #6b351b; border-color: #985e47; }
+  #status { min-height: 1.2em; opacity: .8; }
+</style>
+</head>
+<body>
+<main>
+  <div id="holder"></div>
+  <div class="bar"><button id="play" type="button">Pause</button><button id="still" type="button" aria-pressed="false">Still</button><span id="status">painting…</span></div>
+</main>
+<script>
+/* Gond scene painted with p5.brush. Every static surface is brushed once into a WEBGL buffer in setup (watercolour
+   fills with a little bleed and paper texture, pencil and pen strokes for contours and infill); the moving parts are
+   drawn each frame over those buffers. Geometry follows the Canvas 2D version in ../index.html. */
+'use strict';
+const W = 768, H = 1057, LOOP = 24, TAU = Math.PI * 2, PI = Math.PI, DEG = PI / 180;
+const INK = '#040102', WHITE = '#F4F6F1', CREAM = '#F4F1EC';
+let reducedMotion = false, playing = true, T = 0, last = 0;
+const BUF = {};                                            // name -> { g, x, y, w, h } painted once
+let tree, fronds = [];
+
+/* ───── helpers (same maths as the Canvas version) ───── */
+function rng(a) { return function () { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+function splinePts(pts, seg = 10) {
+  const out = [];
+  for (let i = 0; i < pts.length - 1; i++) {
+    const p0 = pts[Math.max(i - 1, 0)], p1 = pts[i], p2 = pts[i + 1], p3 = pts[Math.min(i + 2, pts.length - 1)];
+    for (let j = 0; j < seg; j++) { const t = j / seg, t2 = t * t, t3 = t2 * t, o = [0, 0]; for (let k = 0; k < 2; k++) o[k] = .5 * (2 * p1[k] + (-p0[k] + p2[k]) * t + (2 * p0[k] - 5 * p1[k] + 4 * p2[k] - p3[k]) * t2 + (-p0[k] + 3 * p1[k] - 3 * p2[k] + p3[k]) * t3); out.push(o); }
+  }
+  out.push(pts[pts.length - 1].slice(0, 2)); return out;
+}
+function resample(pts, sp) {
+  const out = []; let acc = 0, next = 0;
+  for (let i = 0; i < pts.length - 1; i++) { const a = pts[i], b = pts[i + 1], d = Math.hypot(b[0] - a[0], b[1] - a[1]); if (!d) continue; while (next <= acc + d) { const t = (next - acc) / d; out.push([a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, (b[0] - a[0]) / d, (b[1] - a[1]) / d]); next += sp; } acc += d; }
+  return out;
+}
+function ribbon(center, wf) {
+  const L = [], R = [], n = center.length;
+  for (let i = 0; i < n; i++) { const a = center[Math.max(i - 1, 0)], b = center[Math.min(i + 1, n - 1)]; let dx = b[0] - a[0], dy = b[1] - a[1]; const d = Math.hypot(dx, dy) || 1; dx /= d; dy /= d; const w = wf(i / (n - 1)) / 2; L.push([center[i][0] - dy * w, center[i][1] + dx * w]); R.push([center[i][0] + dy * w, center[i][1] - dx * w]); }
+  return { L, R, C: center, outline: L.concat(R.slice().reverse()) };
+}
+const ease = u => u * u * (3 - 2 * u);
+const wave = (t, per, ph) => Math.sin(TAU * t / per + ph);
+const look = (t, per, ph) => Math.tanh(1.7 * Math.sin(TAU * t / per + ph)) / Math.tanh(1.7);
+function keyVal(keys, t) { t = ((t % LOOP) + LOOP) % LOOP; for (let i = 0; i < keys.length - 1; i++) if (t <= keys[i + 1][0]) { const a = keys[i], b = keys[i + 1]; return a[1] + (b[1] - a[1]) * ease((t - a[0]) / (b[0] - a[0])); } return keys[keys.length - 1][1]; }
+const gustAt = t => reducedMotion ? 0 : Math.exp(-Math.pow((t - 9.7) / 1.7, 2));
+const swayAt = t => reducedMotion ? 0 : (.9 * Math.sin(TAU * t / 8) + gustAt(t) * 2.6 * Math.sin(TAU * t / 2.4)) * DEG;
+const surfY = x => 850 + 10 * Math.sin(x / 61 + .6) + 4 * Math.sin(x / 23 + 2);
+const bankY = x => 776 - 16 * Math.exp(-Math.pow((x - 470) / 260, 2)) + 10 * Math.sin(x / 71 + 1) + 3 * Math.sin(x / 27);
+
+/* ───── brush idiom: flat wash, a breath of texture, pencil contour ───── */
+function flat(col, pts, o = {}) {                          // Gond colour is flat: a wash, then a faint textured fill for paper grain
+  brush.noStroke(); brush.noHatch(); brush.wash(col); brush.polygon(pts); brush.noWash();
+  if (o.grain !== false) { brush.fill(col, 60); brush.fillBleed(.04, 'in'); brush.fillTexture(.7, .3); brush.polygon(pts); brush.noFill(); }
+  if (o.line !== false) contour(pts, (o.lw || 1.3) * .8, o.pen || 'HB', o.col || INK, true);
+}
+function contour(pts, lw, pen, col, closed) {
+  brush.noFill(); brush.noWash(); brush.pick(pen); brush.stroke(col); brush.strokeWeight(lw);
+  brush.beginShape(.35); for (const p of pts) brush.vertex(p[0], p[1]); brush.endShape(closed);
+}
+function pen(col, lw, name = 'pen') { brush.noFill(); brush.noWash(); brush.pick(name); brush.stroke(col); brush.strokeWeight(lw); }
+function dotp(x, y, r, col) { brush.noStroke(); brush.wash(col); brush.circle(x, y, r, .25); brush.noWash(); }
+function smoothClosed(pts, k = 1) {                        // Catmull-Rom through a closed control polygon, as points
+  const n = pts.length, out = [];
+  for (let i = 0; i < n; i++) { const p0 = pts[(i - 1 + n) % n], p1 = pts[i], p2 = pts[(i + 1) % n], p3 = pts[(i + 2) % n]; for (let j = 0; j < 6; j++) { const t = j / 6, t2 = t * t, t3 = t2 * t; out.push([.5 * (2 * p1[0] + (-p0[0] + p2[0]) * t * k + (2 * p0[0] - 5 * p1[0] + 4 * p2[0] - p3[0]) * t2 * k + (-p0[0] + 3 * p1[0] - 3 * p2[0] + p3[0]) * t3 * k), .5 * (2 * p1[1] + (-p0[1] + p2[1]) * t * k + (2 * p0[1] - 5 * p1[1] + 4 * p2[1] - p3[1]) * t2 * k + (-p0[1] + 3 * p1[1] - 3 * p2[1] + p3[1]) * t3 * k)]); } }
+  return out;
+}
+function pearls(pts, gap, r, col = CREAM, band = 0, clip = null) {
+  const d = splinePts(pts, 8), keep = p => !clip || inPoly(p[0], p[1], clip);
+  if (band) { pen(INK, band, 'marker'); let run = []; for (const p of d) { if (keep(p)) run.push(p); else { if (run.length > 1) brush.spline(run, .3); run = []; } } if (run.length > 1) brush.spline(run, .3); }
+  for (const p of resample(d, gap)) if (keep(p)) dotp(p[0], p[1], r, col);
+}
+// buffers: each piece gets a fresh WEBGL canvas of its own size (p5.brush keeps compositing everything ever drawn on
+// a canvas, so a shared one would leak earlier pieces), is copied to a plain 2D canvas, and the WebGL context is then
+// released so the browser's limit on live contexts is never reached
+let pending = null;
+function paintBuffer(name, x, y, w, h, fn) {
+  w = Math.ceil(w); h = Math.ceil(h);
+  const g = createGraphics(w, h, WEBGL); g.pixelDensity(pixelDensity());
+  brush.load(g);
+  g.push(); g.translate(-w / 2 - x, -h / 2 - y); fn(g); g.pop();
+  pending = { name, x, y, w, h, g };                       // copied out on the next frame, once the brush has flushed
+}
+function finishBuffer() {
+  if (!pending) return; const { name, x, y, w, h, g: src } = pending, pd = src.pixelDensity();
+  const g = createGraphics(w, h); g.pixelDensity(pd); const img = src.get(0, 0, w, h);
+  img.loadPixels(); const px = img.pixels;                  // WebGL hands back premultiplied colour: undo it, or edges go pale
+  for (let i = 0; i < px.length; i += 4) { const a = px[i + 3]; if (a > 0 && a < 255) { const k = 255 / a; px[i] = Math.min(255, px[i] * k); px[i + 1] = Math.min(255, px[i + 1] * k); px[i + 2] = Math.min(255, px[i + 2] * k); } }
+  img.updatePixels(); g.image(img, 0, 0, w, h);
+  BUF[name] = { g, x, y, w, h }; pending = null;
+  const ext = src.drawingContext.getExtension('WEBGL_lose_context'); if (ext) ext.loseContext(); src.remove();
+}
+function show(name, dx = 0, dy = 0) { const b = BUF[name]; image(b.g, b.x + dx, b.y + dy, b.w, b.h); }
+function showXf(name, px, py, ang, sx = 1) { const b = BUF[name]; push(); translate(px, py); rotate(ang); scale(sx, 1); translate(-px, -py); image(b.g, b.x, b.y, b.w, b.h); pop(); }
+
+/* ───── paper ───── */
+function paintPaper() {
+  const r = rng(11);
+  brush.noStroke(); brush.wash('#F5D3B2'); brush.rect(-10, -10, W + 20, H + 20); brush.noWash();
+  brush.fill('#E8C19C', 22); brush.fillBleed(.2, 'out'); brush.fillTexture(.9, .1);
+  for (let i = 0; i < 5; i++) brush.circle(r() * W, r() * H, 140 + r() * 120);
+  brush.fill('#FBE3C8', 22); for (let i = 0; i < 5; i++) brush.circle(r() * W, r() * H, 140 + r() * 120);
+  brush.noFill();
+}
+
+/* ───── tree ───── */
+const LIMBS = [
+  { p: [[438, 822], [433, 700], [430, 560], [429, 470], [427, 420], [423, 372], [420, 340]], w: 60, trunk: true },
+  { p: [[428, 440], [392, 410], [346, 384], [300, 371], [262, 371], [236, 384], [210, 405], [166, 424], [136, 410], [118, 384]], w: 26 },
+  { p: [[265, 367], [240, 345], [215, 326], [176, 320], [142, 350], [106, 384], [78, 380], [64, 356]], w: 20 },
+  { p: [[215, 326], [168, 302], [122, 280], [88, 258], [75, 246]], w: 16 },
+  { p: [[150, 296], [104, 306], [78, 300], [66, 288]], w: 12 },
+  { p: [[418, 346], [380, 318], [340, 298], [300, 278], [272, 258], [256, 226], [250, 188], [245, 150]], w: 23 },
+  { p: [[245, 153], [212, 140], [186, 116], [175, 86], [197, 61]], w: 16 },
+  { p: [[245, 153], [264, 118], [275, 86], [267, 60]], w: 14 },
+  { p: [[256, 219], [216, 222], [168, 230], [138, 212], [128, 168]], w: 16 },
+  { p: [[420, 346], [410, 290], [398, 238], [384, 196], [360, 168], [337, 125], [313, 76], [300, 32]], w: 26 },
+  { p: [[330, 106], [348, 72], [358, 40]], w: 13 },
+  { p: [[398, 242], [420, 200], [440, 165], [446, 125], [430, 98], [404, 66], [408, 44], [429, 22]], w: 20 },
+  { p: [[446, 126], [480, 106], [510, 75]], w: 13 },
+  { p: [[430, 392], [452, 330], [458, 270], [470, 212], [490, 186]], w: 18 },
+  { p: [[455, 305], [498, 292], [520, 256], [521, 215]], w: 14 },
+  { p: [[432, 470], [466, 430], [504, 396], [543, 376], [588, 400], [628, 430], [668, 442], [700, 424]], w: 25 },
+  { p: [[565, 386], [608, 396], [648, 382], [684, 356]], w: 14 },
+  { p: [[540, 378], [553, 350], [563, 310], [573, 270], [588, 212], [578, 160], [568, 126], [587, 100]], w: 20 },
+  { p: [[566, 303], [628, 306], [673, 297], [695, 258]], w: 14 },
+  { p: [[586, 217], [628, 200], [660, 175]], w: 13 },
+  { p: [[668, 442], [706, 452], [730, 482], [728, 520], [706, 542], [668, 548], [640, 540]], w: 16 },
+  { p: [[424, 812], [398, 822], [368, 836], [344, 840]], w: 22, root: true },
+  { p: [[450, 812], [478, 824], [508, 834], [534, 836]], w: 22, root: true }
+];
+const limbW = L => L.trunk ? (t => 34 + 30 * Math.pow(1 - t, 1.4) + 46 * Math.pow(Math.max(0, 1 - t / .09), 2)) : L.root ? (t => Math.max(.6, L.w * Math.pow(1 - t, .7))) : (t => Math.max(.5, L.w * 1.05 * Math.pow(1 - t, 1.05)));
+function buildTree() {
+  const r = rng(4242);
+  tree = LIMBS.map(L => ({ ...L, center: splinePts(L.p, 9) }));
+  const cx = 385, cy = 250, rx = 308, ry = 214, taken = [];
+  const inside = (x, y) => { const u = (x - cx) / rx, v = (y - cy) / ry; return u * u + v * v < 1 && y < (x < 300 ? 440 : 448) && !(x > 346 && x < 548 && y > 372); };
+  const samples = []; tree.forEach((L, li) => resample(L.center, 12).forEach(p => samples.push([p[0], p[1], li])));
+  const cands = [];
+  tree.forEach((L, li) => { if (L.trunk || L.root) return; const e = L.center[L.center.length - 1], q = L.center[L.center.length - 3]; const d = Math.hypot(e[0] - q[0], e[1] - q[1]) || 1; cands.push({ p: [e[0], e[1], (e[0] - q[0]) / d, (e[1] - q[1]) / d], sd: 0, k: r() - 1, li }); resample(L.center, 17).forEach((p, i) => { if (i < 1) return; for (const sd of [-1, 1]) cands.push({ p, sd, k: r(), li }); }); });
+  cands.sort((a, b) => a.k - b.k);
+  for (const cd of cands) {
+    if (fronds.length >= 34) break;
+    const p = cd.p; let ang;
+    if (!cd.sd) ang = Math.atan2(p[3], p[2]) + (r() - .5) * .5;
+    else { const na = Math.atan2(p[2] * cd.sd, -p[3] * cd.sd), ra = Math.atan2(p[1] - 345, p[0] - 420); let d = ra - na; while (d > PI) d -= TAU; while (d < -PI) d += TAU; ang = na + d * .42 + (r() - .5) * .5; }
+    const len = 62 + r() * 44, mx = p[0] + Math.cos(ang) * len * .55, my = p[1] + Math.sin(ang) * len * .55, tx = p[0] + Math.cos(ang) * len, ty = p[1] + Math.sin(ang) * len;
+    if (!inside(tx, ty) || !taken.every(q => Math.hypot(q[0] - mx, q[1] - my) > 56)) continue;
+    if (samples.some(q => q[2] !== cd.li && (Math.hypot(q[0] - mx, q[1] - my) < 16 || Math.hypot(q[0] - tx, q[1] - ty) < 16))) continue;
+    taken.push([mx, my]);
+    const pts = [[p[0], p[1]]]; let a = ang, x = p[0], y = p[1]; const n = Math.round(len / 9), curl = (r() - .5) * .11, ph = r() * TAU;
+    for (let i = 0; i < n; i++) { a += curl + Math.sin(i * .55 + ph) * .035; x += Math.cos(a) * 9; y += Math.sin(a) * 9; pts.push([x, y, a]); }
+    fronds.push({ pts, n, seed: (r() * 1e6) | 0 });
+  }
+}
+function paintTree() {
+  const r = rng(77);
+  for (const f of fronds) {                                // fronds: a brown stem and paired pale leaflets, pen-outlined
+    const fr = rng(f.seed), P = f.pts;
+    pen('#5A2C16', 1.6, '2B'); brush.spline(P.map(p => [p[0], p[1]]), .4);
+    const leaf = (x, y, a, l) => { const w = l * .3, dx = Math.cos(a), dy = Math.sin(a), nx = -dy, ny = dx; const pts = []; for (let i = 0; i <= 8; i++) { const u = i / 8; pts.push([x + dx * l * u + nx * w * Math.sin(PI * u), y + dy * l * u + ny * w * Math.sin(PI * u)]); } for (let i = 7; i >= 1; i--) { const u = i / 8; pts.push([x + dx * l * u - nx * w * Math.sin(PI * u), y + dy * l * u - ny * w * Math.sin(PI * u)]); } flat(WHITE, pts, { grain: false, lw: .9, pen: 'pen' }); pen(INK, .6, 'pen'); brush.line(x + dx * 2, y + dy * 2, x + dx * l * .8, y + dy * l * .8); };
+    for (let i = 1; i <= f.n; i++) { const p = P[i], t = i / f.n; for (const s of [-1, 1]) leaf(p[0], p[1], p[2] + s * (1.02 - .3 * t) + (fr() - .5) * .2, (16 + fr() * 4) * (1 - .2 * t)); }
+    const e = P[f.n]; leaf(e[0], e[1], e[2], 17);
+  }
+  for (const L of tree) {                                  // bark: dark heartwood, lighter mid, green tip, pencil contour
+    const rb = ribbon(L.center, limbW(L)), n = rb.L.length - 1;
+    if (L.trunk || L.root) flat('#4A2513', rb.outline, { lw: 2.2, pen: 'HB' });
+    else {
+      const i1 = Math.round(n * .55), i2 = Math.round(n * .85), seg = (a, b) => rb.L.slice(a, b + 1).concat(rb.R.slice(a, b + 1).reverse());
+      flat('#5A2C16', seg(0, i1), { line: false }); flat('#7A4424', seg(i1, i2), { line: false }); flat('#3F6B34', seg(i2, n), { line: false });
+      contour(rb.outline, Math.max(1.1, .1 * L.w), 'HB', INK, true);
+      pearls([rb.L[i1], rb.R[i1]], 4.6, 1.6, CREAM, 2.6);
+    }
+    // bark dashes in rows along the limb
+    pen('#F1E4C8', .9, 'marker');
+    const pts = resample(L.center, 7), wf = limbW(L);
+    pts.forEach((p, i) => {
+      const t = i / (pts.length - 1), w = wf(t); if (w < 5) return;
+      const nr = Math.max(1, Math.round(w / 6) - 1);
+      for (let k = 0; k < nr; k++) { if ((i + k) % 2) continue; const o = nr === 1 ? 0 : -.36 + .72 * k / (nr - 1), x = p[0] - p[3] * o * w, y = p[1] + p[2] * o * w; brush.line(x, y, x + p[2] * 4.5, y + p[3] * 4.5); }
+    });
+  }
+}
+
+/* ───── bank and water ───── */
+function paintGrass() {
+  const r = rng(616), pts = [[-12, 890]]; for (let x = -12; x <= W + 12; x += 8) pts.push([x, bankY(x)]); pts.push([W + 12, 890]);
+  brush.noStroke(); brush.wash('#8FA466'); brush.polygon(pts); brush.noWash();
+  brush.noFill(); brush.hatch(9, 80, { rand: .3, continuous: false }); brush.hatchStyle('pen', '#2F5E2A', 1.4); brush.polygon(pts); brush.noHatch();
+  pen('#D9DDA2', 1, 'marker'); for (let i = 0; i < 420; i++) { const x = -10 + r() * (W + 20), y = bankY(x) + 8 + r() * 100; brush.line(x, y, x + 1, y - 7); }
+  pen(INK, 2.2, 'HB'); brush.spline(pts.slice(1, -1), .2);
+  for (let x = -6; x <= W + 6; x += 9) dotp(x, bankY(x) + 7, 2, '#F0D24A');
+  pen('#2F5E2A', 1.6, '2B'); for (let x = 4; x < W; x += 15 + r() * 14) for (const k of [-1, 0, 1]) { const a = -PI / 2 + k * .4, l = 13 + r() * 7; brush.line(x, bankY(x) + 1, x + Math.cos(a) * l, bankY(x) + 1 + Math.sin(a) * l); }
+}
+function waterPts() { const pts = [[-12, H + 12]]; for (let x = -12; x <= W + 12; x += 6) pts.push([x, surfY(x)]); pts.push([W + 12, H + 12]); return pts; }
+function paintWater() {
+  const r = rng(700), tones = ['#2B5BC4', '#3F86D6', '#16307E', '#7DB7E6', '#1C6E8C', '#1F3FA6'], edges = ['#F0D24A', '#E08A3C', '#F4F3EE', '#7FC4E8'];
+  brush.noStroke(); brush.wash('#1B3E9C'); brush.polygon(waterPts()); brush.noWash();
+  const rows = []; let ti = 0, li = 0;
+  for (let k = 0; k < 6; k++) { const yc = 846 + 36 * k, row = []; let x = -160 + (k % 2) * 130 + r() * 40; while (x < W + 60) { const len = 230 + r() * 120, h = 46 + r() * 18, tilt = (r() - .5) * .16; ti = (ti + 1 + ((r() * 3) | 0)) % tones.length; row.push({ x, y: yc + (r() - .5) * 14, len, h, tilt, tone: tones[ti], i: li++ }); x += len * (.62 + r() * .1); } rows.push(row); }
+  brush.clip([0, 835, W, H]);
+  for (let k = 5; k >= 0; k--) for (const L of rows[k]) {
+    const P0 = [L.x, L.y], P1 = [L.x + L.len, L.y + L.tilt * L.len], dx = P1[0] - P0[0], dy = P1[1] - P0[1], d = Math.hypot(dx, dy), nx = -dy / d, ny = dx / d;
+    const lens = []; for (let i = 0; i <= 14; i++) { const u = i / 14, m = 1 - u, bulge = Math.sin(PI * u); lens.push([P0[0] + dx * u - nx * L.h * 1.1 * bulge, P0[1] + dy * u - ny * L.h * 1.1 * bulge]); } for (let i = 13; i >= 1; i--) { const u = i / 14, bulge = Math.sin(PI * u); lens.push([P0[0] + dx * u + nx * L.h * .9 * bulge, P0[1] + dy * u + ny * L.h * .9 * bulge]); }
+    brush.noStroke(); brush.fill(L.tone, 235); brush.fillBleed(.08, 'out'); brush.fillTexture(.5, .25); brush.polygon(lens); brush.noFill();
+    pen('#0B1640', .9, 'pen');
+    const R = 14, ang = Math.atan(L.tilt); let row = 0;
+    for (let y = -L.h; y < L.h; y += R * .62, row++) for (let x = -L.len * .5 - (row % 2) * R; x < L.len * .5; x += 2 * R) {
+      const cx = P0[0] + dx / 2 + x * Math.cos(ang) - y * Math.sin(ang), cy = P0[1] + dy / 2 + x * Math.sin(ang) + y * Math.cos(ang);
+      const inLobe = Math.abs(x) < L.len * .5 - 6 && Math.abs(y) < L.h * Math.sin(PI * (x / L.len + .5)) * .95;
+      if (!inLobe || cy < surfY(cx) + 4) continue;
+      for (const f of [.9, .62, .34]) brush.arc(cx, cy, R * f, 187, 353);
+    }
+    const top = []; for (let i = 0; i <= 14; i++) top.push(lens[i]);
+    if (L.i % 2 === 0) { pen('#F2F4F0', 1.4, 'pen'); brush.spline(top, .3); }
+    else { const col = edges[L.i % 4]; for (const p of resample(top, 7.5)) if (p[1] > surfY(p[0]) + 3) dotp(p[0], p[1], 2, col); }
+  }
+  brush.noClip();
+  const surf = []; for (let x = -12; x <= W + 12; x += 6) surf.push([x, surfY(x)]);
+  pen(INK, 2, 'HB'); brush.spline(surf, .2);
+  for (let x = -4; x <= W + 4; x += 8) dotp(x, surfY(x) + 6, 2, '#F4F3EE');
+}
+const WEEDS = [[26, 258], [196, 150], [326, 96], [470, 132], [606, 168], [744, 266]];
+function paintWeeds() {
+  const r = rng(720);
+  const leaf = (x, y, a, l) => { const dx = Math.cos(a), dy = Math.sin(a), nx = -dy, ny = dx, w = l * .2, half = s => { const pts = [[x, y]]; for (let i = 1; i <= 6; i++) { const u = i / 6; pts.push([x + dx * l * u + nx * w * s * 1.6 * Math.sin(PI * u), y + dy * l * u + ny * w * s * 1.6 * Math.sin(PI * u)]); } return pts; };
+    flat('#3A8F45', half(1), { grain: false, line: false }); flat('#0F2A14', half(-1), { grain: false, line: false }); contour(half(1).concat(half(-1).slice(1).reverse()), .9, 'pen', INK, true); };
+  const stem = (x, y, a0, len, w0, depth) => {
+    const pts = [[x, y, a0]]; let a = a0; const curl = (r() - .5) * .05, n = Math.round(len / 7);
+    for (let i = 0; i < n; i++) { a += curl + Math.sin(i * .5 + x) * .03; x += Math.cos(a) * 7; y += Math.sin(a) * 7; pts.push([x, y, a]); }
+    const rb = ribbon(pts, t => w0 * (1 - .55 * t)); flat('#7A4424', rb.outline, { grain: false, lw: 1, pen: 'pen' });
+    for (let i = 1; i < n; i += 2) dotp(pts[i][0], pts[i][1], 1.5, CREAM);
+    for (let i = 2; i <= n; i += 2) { const p = pts[i], t = i / n; for (const s of [-1, 1]) leaf(p[0], p[1], p[2] + s * (.85 - .2 * t), (26 + r() * 6) * (1 - .3 * t)); }
+    leaf(pts[n][0], pts[n][1], pts[n][2], 24);
+    if (depth < 1 && len > 80) { const k = Math.round(n * .4); stem(pts[k][0], pts[k][1], pts[k][2] + (r() < .5 ? -1 : 1) * .6, len * .5, w0 * .7, 1); }
+  };
+  brush.clip([0, 840, W, H + 20]);
+  WEEDS.forEach(P => stem(P[0], H + 6, -PI / 2 + (r() - .5) * .16, P[1], 8, 0));
+  brush.noClip();
+}
+
+/* ───── deer ───── */
+const DEER = {
+  A: { x: 206, y: 838, s: 1.06, f: 1, gold: true, ph: 0, keys: [[0, 0], [2, 0], [4.2, 1], [7.6, 1], [9.1, -1], [12.5, -1], [14, 0], [24, 0]] },
+  B: { x: 596, y: 862, s: .96, f: -1, gold: false, ph: 2, keys: [[0, 0], [8.7, 0], [9.5, -1], [12.8, -1], [14.5, 0], [16.8, 1], [21, 1], [23, 0], [24, 0]] }
+};
+const DT = {
+  body: [[0, -162], [38, -174], [96, -166], [150, -168], [198, -176], [230, -164], [244, -134], [240, -106], [224, -88], [196, -94], [158, -106], [112, -94], [64, -74], [28, -72], [2, -88], [-14, -122], [-12, -148]],
+  spine: [[-30, -124], [30, -132], [100, -128], [170, -132], [215, -140], [262, -118]],
+  legs: [[[54, -108], [58, -54], [54, -28], [56, -2]], [[190, -112], [204, -60], [192, -30], [196, -2]], [[24, -112], [21, -56], [23, -28], [20, 0]], [[214, -116], [230, -60], [216, -30], [221, 0]]],
+  legW: [19, 27, 21, 31],
+  tail: [[232, -156], [252, -150], [268, -128], [274, -98], [268, -66], [256, -48], [254, -72], [248, -98], [240, -122], [228, -138]],
+  REST: [[14, -138], [-14, -164], [-36, -190], [-62, -204]], DOWN: [[14, -138], [-17, -116], [-37, -88], [-46, -60]], ALERT: [[14, -138], [-2, -172], [-10, -202], [-32, -220]], HIP: [214, -100]
+};
+const HEAD = { pts: [[396, 468], [404, 444], [424, 430], [452, 426], [482, 434], [508, 446], [530, 456], [541, 464], [538, 472], [526, 477], [508, 478], [486, 486], [458, 498], [428, 506], [406, 500]], earL: [[404, 448], [380, 410], [350, 372], [357, 420], [386, 452]], earR: [[446, 428], [458, 392], [484, 362], [480, 398], [462, 428]], pivot: [405, 492] };
+const GOLD = { base: '#6B4310', arcs: ['#E3A62A', '#D99013', '#EDB73A', '#CF8E1E'] }, PINK = { pale: '#F2C4C0', red: '#B83F56', paleMark: '#B83F56', redMark: '#F6D7D2' };
+const toC = (D, p) => [D.x + p[0] * D.s * D.f, D.y + p[1] * D.s];
+function scalesAlong(spine, half, Rf, cb, stepK = .62, gapK = 2) {   // rows of marks laid across a spine, turning with the form
+  const P = resample(splinePts(spine, 8), 1), n = P.length - 1; let sd = 0, row = 0;
+  while (sd <= n) { const u = sd / n, p = P[Math.round(sd)], R = Rf(u), g = gapK * R, m = Math.ceil((half + R) / g); for (let j = -m; j <= m; j++) { const off = (j + (row % 2) * .5) * g; cb(p[0] - p[3] * off, p[1] + p[2] * off, Math.atan2(p[3], p[2]), R, row, j, u); } sd += R * stepK; row++; }
+}
+function goldScales(spine, half, Rf, clipPts) {
+  brush.noWash(); brush.noFill();
+  scalesAlong(spine, half, Rf, (x, y, th, R, row, j) => {
+    if (!inPoly(x, y, clipPts)) return;
+    pen(GOLD.arcs[(row + j) & 3], 1.7, 'rotring'); const a0 = th / DEG + 180;
+    brush.arc(x, y, R * .86, a0 - 84, a0 + 84); brush.arc(x, y, R * .56, a0 - 84, a0 + 84); brush.arc(x, y, R * .26, a0 - 80, a0 + 80);
+    if (row % 2 === 0 && (((j + row / 2) % 2) + 2) % 2 === 0) dotp(x - Math.cos(th) * R * .98, y - Math.sin(th) * R * .98, R * .24, CREAM);
+  });
+}
+function inPoly(x, y, poly) { let c = false; for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) { const xi = poly[i][0], yi = poly[i][1], xj = poly[j][0], yj = poly[j][1]; if ((yi > y) !== (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi) c = !c; } return c; }
+function paintDeerBody(D) {                                // local frame: faces left, origin at the near front hoof
+  const body = smoothClosed(DT.body), gold = D.gold;
+  const leg = (pts, w0, far, k) => {
+    const rb = ribbon(splinePts(pts, 8), t => w0 - (w0 - 8) * Math.min(1, 1.7 * t)), n = rb.C.length - 1;
+    if (gold) { flat(far ? '#4A2E0A' : GOLD.base, rb.outline, { lw: 1.4, pen: '2B' }); goldScales([[pts[0][0], pts[0][1] - 10], ...pts, [pts[3][0], pts[3][1] + 10]], w0 / 2, u => 7.5 - 3 * u, rb.outline); }
+    else {
+      [[0, .3, 1], [.3, .55, 0], [.55, .8, 1], [.8, 1, 0]].forEach((sc, si) => { const i0 = Math.round(sc[0] * n), i1 = Math.round(sc[1] * n), seg = rb.L.slice(i0, i1 + 1).concat(rb.R.slice(i0, i1 + 1).reverse()); flat(sc[2] ? PINK.red : PINK.pale, seg, { line: false }); pen(sc[2] ? PINK.redMark : PINK.paleMark, 1.2, 'pen'); for (const p of resample(rb.C.slice(i0, i1 + 1), 6)) for (const f of [-.3, .3]) { const x = p[0] - p[3] * f * w0 * .8, y = p[1] + p[2] * f * w0 * .8; brush.line(x - 2, y - 2, x + 2, y + 3); } if (si) pearls([rb.L[i0], rb.R[i0]], 5, 1.7, CREAM, 2.4); });
+      if (far) { brush.noStroke(); brush.fill('#3C0A14', 60); brush.fillBleed(.02, 'in'); brush.fillTexture(.2, 0); brush.polygon(rb.outline); brush.noFill(); }
+      contour(rb.outline, 1.4, '2B', INK, true);
+    }
+    flat(INK, rb.L.slice(n - 3).concat(rb.R.slice(n - 3).reverse()), { grain: false, line: false });
+  };
+  leg(DT.legs[0], DT.legW[0], true, 0); leg(DT.legs[1], DT.legW[1], true, 1);
+  flat(INK, smoothClosed(DT.tail), { lw: 1.6, pen: '2B' });
+  pen('#D9D2C2', 1.1, 'pen'); for (const p of resample(splinePts([[236, -150], [262, -118], [268, -80], [256, -52]], 6), 7)) brush.line(p[0] - 3, p[1], p[0] + 3, p[1] + 1);
+  if (gold) {
+    flat(GOLD.base, body, { lw: 2.4, pen: 'HB' });
+    goldScales(DT.spine, 62, u => 8 + 4.5 * Math.sin(PI * u), body);
+    pearls([[40, -174], [24, -130], [44, -86]], 6.6, 2.6, CREAM, 5); pearls([[186, -174], [200, -128], [176, -90]], 6.6, 2.6, CREAM, 5);
+    contour(body, 2.4, 'HB', INK, true);
+  } else {
+    flat(PINK.pale, body, { line: false });
+    const P = resample(splinePts(DT.spine, 8), 1), n = P.length - 1;
+    // red bands across the body: a coverage of small washes along the spine, kept inside the silhouette
+    brush.noStroke(); brush.wash(PINK.red);
+    scalesAlong(DT.spine, 64, () => 3, (x, y, th, R, row, j, u) => { if (Math.floor(Math.min(.999, u) * 7) % 2 === 0 && inPoly(x, y, body)) brush.circle(x, y, 4.6, .2); }, 1, 1.6);
+    brush.noWash();
+    scalesAlong(DT.spine, 62, () => 5, (x, y, th, R, row, j, u) => { if (!inPoly(x, y, body)) return; const red = Math.floor(Math.min(.999, u) * 7) % 2 === 0; pen(red ? PINK.redMark : PINK.paleMark, 1.3, 'pen'); brush.line(x - Math.cos(th) * 2.4, y - Math.sin(th) * 2.4, x + Math.cos(th) * 2.4, y + Math.sin(th) * 2.4); }, 1.8);
+    for (let k = 1; k <= 6; k++) { const p = P[Math.round(n * k / 7)]; pearls([[p[0] + p[3] * 62, p[1] - p[2] * 62], [p[0] + p[2] * 4, p[1] + p[3] * 4], [p[0] - p[3] * 62, p[1] + p[2] * 62]], 6, 2.1, CREAM, 4, body); }
+    contour(body, 2.4, 'HB', INK, true);
+  }
+  leg(DT.legs[2], DT.legW[2], false, 2); leg(DT.legs[3], DT.legW[3], false, 3);
+}
+function paintHead(D) {
+  const gold = D.gold, headCol = gold ? '#D99013' : PINK.red, earCol = gold ? '#3F7A3A' : '#1C6E8C', mark = gold ? '#FBE9C4' : '#F3D9D4', dark = gold ? '#7A4A08' : '#3E0B14';
+  for (const e of [HEAD.earL, HEAD.earR]) { flat(earCol, smoothClosed(e), { lw: 1.6, pen: '2B' }); pen('#EDEFEA', 1.4, 'pen'); brush.line(e[0][0] + 2, e[0][1], e[2][0] + 2, e[2][1] + 2); }
+  const hp = smoothClosed(HEAD.pts); flat(headCol, hp, { lw: 2.4, pen: 'HB' });
+  let cx = 0, cy = 0; HEAD.pts.forEach(p => { cx += p[0]; cy += p[1]; }); cx /= HEAD.pts.length; cy /= HEAD.pts.length;
+  [[.84, 7, mark], [.66, 7, dark], [.48, 7, mark]].forEach(g => { const ring = HEAD.pts.map(p => [cx + (p[0] - cx) * g[0], cy + (p[1] - cy) * g[0]]); ring.push(ring[0]); for (const p of resample(splinePts(ring, 6), g[1])) dotp(p[0], p[1], 1.3, g[2]); });
+  // eye, nose, mouth
+  const ex = 458, ey = 446; flat('#F4F2EC', [[ex - 20, ey], [ex - 10, ey - 8], [ex + 4, ey - 9], [ex + 18, ey - 3], [ex + 20, ey + 1], [ex + 8, ey + 7], [ex - 8, ey + 7]], { grain: false, lw: 1.2, pen: 'pen' });
+  dotp(ex + 1, ey - 1, 7, INK); dotp(ex - 1, ey - 3, 1.6, '#DDD');
+  dotp(536, 465, 5, INK); pen(INK, 1.4, 'pen'); brush.line(526, 477, 512, 474);
+}
+function deerRig(D, t) {
+  const v = reducedMotion ? 0 : keyVal(D.keys, t), vh = reducedMotion ? 0 : keyVal(D.keys, t - .25), dn = Math.max(0, v), th = 7 * DEG * dn;
+  const sip = vh > .9 ? .035 * Math.sin(TAU * t * 1.3) : 0, tgt = v >= 0 ? DT.DOWN : DT.ALERT, k = v >= 0 ? v + sip : -v;
+  let pts = DT.REST.map((p, i) => [p[0] + (tgt[i][0] - p[0]) * k, p[1] + (tgt[i][1] - p[1]) * k]);
+  for (let i = 1; i < pts.length; i++) { const L = Math.hypot(DT.REST[i][0] - DT.REST[i - 1][0], DT.REST[i][1] - DT.REST[i - 1][1]), dx = pts[i][0] - pts[i - 1][0], dy = pts[i][1] - pts[i - 1][1], d = Math.hypot(dx, dy) || 1, sx = pts[i - 1][0] + dx / d * L - pts[i][0], sy = pts[i - 1][1] + dy / d * L - pts[i][1]; for (let q = i; q < pts.length; q++) pts[q] = [pts[q][0] + sx, pts[q][1] + sy]; }
+  const cs = Math.cos(-th), sn = Math.sin(-th), rot = p => { const x = p[0] - DT.HIP[0], y = p[1] - DT.HIP[1]; return [DT.HIP[0] + x * cs - y * sn, DT.HIP[1] + x * sn + y * cs]; };
+  pts = pts.map(rot);
+  const kk = .57, hx = 136 * kk, hy = -27 * kk, e = pts[pts.length - 1], yt = (surfY(D.x - 100 * D.s * D.f) + 6 - D.y) / D.s;
+  const haDown = Math.atan2(-hy, hx) + Math.asin(Math.max(-1, Math.min(1, (yt - e[1]) / Math.hypot(hx, hy))));
+  const ha = vh >= 0 ? 14 * DEG + (haDown - 14 * DEG) * vh : 14 * DEG - 22 * DEG * (-vh);
+  const rx = hx * Math.cos(ha) - hy * Math.sin(ha), ry = hx * Math.sin(ha) + hy * Math.cos(ha);
+  D.muzzle = toC(D, [e[0] - rx, e[1] + ry]);
+  return { v, dn, th, pts, ha, rot };
+}
+function drawNeck(D, rg) {                                 // per frame, plain p5 in the same colours
+  push(); translate(D.x, D.y); scale(D.s * D.f, D.s);
+  const rb = ribbon(splinePts(rg.pts, 7), u => 50 - 22 * u), n = rb.C.length - 1;
+  noStroke(); fill(D.gold ? GOLD.base : PINK.pale); beginShape(); for (const p of rb.outline) vertex(p[0], p[1]); endShape(CLOSE);
+  if (D.gold) {
+    noFill(); strokeWeight(1.6);
+    scalesAlong(rg.pts.slice().reverse(), 26, u => 6.5 + 3 * u, (x, y, th, R, row, j) => { if (!inPoly(x, y, rb.outline)) return; stroke(GOLD.arcs[(row + j) & 3]); arc(x, y, R * 1.7, R * 1.7, th + PI - 1.5, th + PI + 1.5); arc(x, y, R * 1.1, R * 1.1, th + PI - 1.5, th + PI + 1.5); if (row % 2 === 0 && (((j + row / 2) % 2) + 2) % 2 === 0) { noStroke(); fill(CREAM); circle(x - Math.cos(th) * R * .98, y - Math.sin(th) * R * .98, R * .5); noFill(); } });
+  } else {
+    for (let i = 0; i < n; i++) { const red = Math.floor(i / 4) % 2; noStroke(); fill(red ? PINK.red : PINK.pale); quad(rb.L[i][0], rb.L[i][1], rb.L[i + 1][0], rb.L[i + 1][1], rb.R[i + 1][0], rb.R[i + 1][1], rb.R[i][0], rb.R[i][1]); if (i % 2 === 0) { fill(red ? PINK.redMark : PINK.paleMark); for (const f of [.25, .5, .75]) circle(rb.L[i][0] + (rb.R[i][0] - rb.L[i][0]) * f, rb.L[i][1] + (rb.R[i][1] - rb.L[i][1]) * f, 3.4); } if (i && i % 4 === 0) { stroke(INK); strokeWeight(3.4); line(rb.L[i][0], rb.L[i][1], rb.R[i][0], rb.R[i][1]); noStroke(); fill(CREAM); for (const f of [.15, .32, .5, .68, .85]) circle(rb.L[i][0] + (rb.R[i][0] - rb.L[i][0]) * f + 3, rb.L[i][1] + (rb.R[i][1] - rb.L[i][1]) * f - 3, 3); } }
+  }
+  noFill(); stroke(INK); strokeWeight(2.2); beginShape(); for (const p of rb.outline) vertex(p[0], p[1]); endShape(CLOSE);
+  pop();
+}
+function drawDeer(K, t) {
+  const D = DEER[K], rg = D.rig = deerRig(D, t), hp = toC(D, DT.HIP), f = D.f;
+  showXf('body' + K, hp[0], hp[1], -rg.th * f);
+  drawNeck(D, rg);
+  const e = rg.pts[rg.pts.length - 1], b = BUF['head' + K];
+  push(); translate(D.x, D.y); scale(D.s * D.f, D.s); translate(e[0], e[1]); scale(-1, 1); rotate(rg.ha); scale(.57, .57); translate(-HEAD.pivot[0], -HEAD.pivot[1]); image(b.g, b.x, b.y, b.w, b.h); pop();
+}
+
+/* ───── birds, fish, turtle ───── */
+const TREE_BIRDS = [[412, 172, 42, -1, -30], [328, 232, 60, 1, -25], [256, 316, 50, 1, -8], [305, 342, 44, -1, -30], [512, 314, 52, 1, -30], [582, 366, 46, 1, -5]].map((b, i) => ({ x: b[0], y: b[1], s: b[2], dir: b[3], rot: b[4] * DEG, col: [null, '#1F6FA8', null, '#C2475A', null, '#E0A21C'][i], col2: [null, '#E0A21C', null, '#1F6FA8', null, '#C2475A'][i] }));
+const SMALL_BIRDS = [{ ride: 'A', lx: 86, ly: -170, col: '#1F6FA8', wing: '#C2475A', flip: false }, { ride: 'B', lx: 206, ly: -172, col: '#3F7A3A', wing: '#E0A21C', flip: false }, { x: 54, y: 733, col: '#D99013', wing: '#6C1521', flip: false }, { x: 686, y: 491, col: '#D99013', wing: '#6C1521', flip: true, sway: true }];
+function paintBlackBird(b) {                               // drawn facing right about its feet
+  const s = b.s, col = b.col || INK;
+  pen(INK, 1.6, 'pen'); brush.line(-.1 * s, .1 * s, -.14 * s, .48 * s); brush.line(.06 * s, .12 * s, .08 * s, .48 * s);
+  const R = (pts, a) => pts.map(p => [p[0] * Math.cos(a) - p[1] * Math.sin(a), p[0] * Math.sin(a) + p[1] * Math.cos(a)]);
+  const tail = R([[-.3 * s, -.16 * s], [-1.0 * s, .04 * s], [-.98 * s, .2 * s], [-.25 * s, .2 * s]], b.rot), body = R(ell(0, 0, .5 * s, .29 * s), b.rot), head = R(ell(.42 * s, -.22 * s, .2 * s, .19 * s), b.rot), beak = R([[.56 * s, -.33 * s], [.86 * s, -.27 * s], [.58 * s, -.14 * s]], b.rot);
+  flat(b.col ? b.col2 : INK, tail, { lw: 1.2 }); flat(col, body, { lw: 1.4 }); flat(col, head, { lw: 1.4 }); flat(b.col ? '#3A1E12' : INK, beak, { grain: false, lw: 1 });
+  pen('#E9EDEB', 1, 'pen'); for (let k = 0; k < 5; k++) { const a = R([[(.14 - .1 * k) * s, -.07 * s], [(.08 - .1 * k) * s, .07 * s]], b.rot); brush.line(a[0][0], a[0][1], a[1][0], a[1][1]); }
+  const e = R([[.47 * s, -.25 * s]], b.rot)[0]; dotp(e[0], e[1], .07 * s, WHITE); dotp(e[0], e[1], .03 * s, INK);
+}
+function ell(cx, cy, rx, ry, n = 14) { const o = []; for (let i = 0; i < n; i++) { const a = i / n * TAU; o.push([cx + Math.cos(a) * rx, cy + Math.sin(a) * ry]); } return o; }
+function paintSmallBird(b) {                               // facing left about its feet, as the Gond bird of the source painting
+  const S = .8, P = pts => pts.map(p => [p[0] * S, -50 + p[1] * S]);
+  const rot = -55 * DEG, R = pts => pts.map(p => [p[0] * Math.cos(rot) - p[1] * Math.sin(rot), p[0] * Math.sin(rot) + p[1] * Math.cos(rot)]);
+  pen(INK, 2.2, 'pen'); for (const l of [[-10, 34, -11, 50], [3, 33, 4, 50]]) { brush.line(l[0], -50 + l[1], l[2], -50 + l[3]); for (const a of [-150, -90, -30]) brush.line(l[2], -50 + l[3], l[2] + Math.cos(a * DEG) * 6, -50 + l[3] - Math.sin(a * DEG) * 3); }
+  const tail = P(R([[-2, 12], [-28, 24], [-58, 18], [-84, -2], [-93, -13], [-66, 3], [-34, 8], [-10, 0]])), wing = P(R(smoothClosed([[-5, -3], [-30, -28], [-60, -24], [-80, -9], [-55, 6], [-25, 4]]))), head = P(R(ell(0, 0, 15, 14.5))), beak = P(R([[11, -6], [29, -1], [11, 6]]));
+  flat(b.col, tail, { lw: 1.3 }); flat(b.wing, wing, { lw: 1.3 });
+  pen('#1D0509', .9, 'pen'); for (let i = 0; i < 9; i++) { const u = (i + 1) / 10, c = P(R([[-5 - 75 * u, -3 - 6 * u], [-15 - 75 * u, -18 - 6 * u], [-15 - 75 * u, 9 - 6 * u]])); brush.line(c[0][0], c[0][1], c[1][0], c[1][1]); brush.line(c[0][0], c[0][1], c[2][0], c[2][1]); }
+  flat('#3A1E12', beak, { grain: false, lw: 1 }); flat(b.col, head, { lw: 1.3 });
+  const e = P(R([[1, -1]]))[0]; dotp(e[0], e[1], 6.5, INK); dotp(e[0], e[1], 5, '#F1F1EC'); dotp(e[0], e[1], 3.2, INK); dotp(e[0], e[1], 1.6, '#8A8A84');
+}
+function fanWing(s, col, col2, fly, t, ph) {              // flight: both wings raised as feather fans (plain p5 per frame)
+  const beat = look(t, .55, ph);
+  for (const far of [1, 0]) { push(); translate((.02 - .14 * far) * s, -.12 * s); rotate((-104 - 34 * beat - 20 * far) * DEG); for (let k = 0; k < 4; k++) { const L = (1.02 - .11 * Math.abs(k - 1.5)) * s * fly; push(); rotate((k - 1.5) * (.2 + .05 * beat) * fly); noStroke(); fill(k % 2 ? (col2 || INK) : (col || INK)); beginShape(); for (let q = 0; q <= 8; q++) vertex(L * q / 8, -.15 * s * Math.sin(PI * q / 8)); for (let q = 8; q >= 0; q--) vertex(L * q / 8, .15 * s * Math.sin(PI * q / 8)); endShape(CLOSE); stroke(col ? INK : WHITE); strokeWeight(.9); line(L * .36, 0, L * .84, 0); pop(); } pop(); }
+}
+function birdState(b, gi, t) {
+  const perched = { x: b.x, y: b.y, fly: 0, face: 0, rot: 0 }; if (reducedMotion) return perched;
+  const out0 = 9 + .05 * gi, outDur = 1.8, back0 = 13 + .78 * gi, backDur = 2.2; if (t < out0 || t > back0 + backDur) return perched;
+  const dir = gi < 6 ? 1 : -1, k = .78 + .05 * (gi % 5), orbit = tt => { const a = dir * TAU * (tt - 9) / 6.5 + gi * TAU / 10; return [384 + Math.cos(a) * 318 * k, 272 + Math.sin(a) * 196 * k + 14 * Math.sin(TAU * tt / 1.7 + gi)]; };
+  const pos = tt => { const o = orbit(tt); if (tt < out0 + outDur) { const u = ease(Math.max(0, (tt - out0) / outDur)); return [b.x + (o[0] - b.x) * u, b.y + (o[1] - b.y) * u]; } if (tt > back0) { const u = ease(Math.min(1, (tt - back0) / backDur)); return [o[0] + (b.x - o[0]) * u, o[1] + (b.y - o[1]) * u]; } return o; };
+  const p = pos(t), q = pos(t - .04), vx = p[0] - q[0], vy = p[1] - q[1]; let fly = 1;
+  if (t < out0 + outDur) fly = ease(Math.min(1, (t - out0) / outDur / .2)); else if (t > back0) fly = ease(Math.min(1, (1 - (t - back0) / backDur) / .2));
+  return { x: p[0], y: p[1], fly, face: fly > .5 ? (vx < 0 ? -1 : 1) : 0, rot: Math.atan2(vy, Math.abs(vx) || 1e-6) * .4 * fly };
+}
+const FISH = [{ cx: 250, y: 918, ax: 175, per: 24, ph: 0, len: 80, col: '#C2261E', mark: '#F6E3DC' }, { cx: 520, y: 968, ax: 190, per: 24, ph: 2.4, len: 72, col: '#E0622A', mark: '#F8ECD8' }, { cx: 390, y: 1014, ax: 240, per: 24, ph: 4.4, len: 64, col: '#D99013', mark: '#3A1E0A' }, { cx: 610, y: 902, ax: 115, per: 12, ph: 1.2, len: 56, col: '#F2C4C0', mark: '#B83F56' }];
+function paintFish(F) {                                    // facing right, origin at the body centre
+  const L = F.len, body = []; for (let i = 0; i <= 14; i++) { const u = i / 14; body.push([L * (.5 - u), 0]); }
+  const rb = ribbon(body, u => L * .36 * Math.sin(PI * (.12 + .8 * u)) * (1 - .5 * u)), e = body[14];
+  flat('#8FA873', [[e[0], e[1]], [e[0] - L * .3, -L * .17], [e[0] - L * .13, 0], [e[0] - L * .3, L * .17]], { grain: false, lw: 1.1 });
+  flat('#8FA873', [rb.L[4], [(rb.L[4][0] + rb.L[8][0]) / 2 - L * .06, (rb.L[4][1] + rb.L[8][1]) / 2 - L * .2], rb.L[8]], { grain: false, lw: 1 });
+  flat('#8FA873', [rb.R[4], [(rb.R[4][0] + rb.R[8][0]) / 2 - L * .06, (rb.R[4][1] + rb.R[8][1]) / 2 + L * .12], rb.R[8]], { grain: false, lw: 1 });
+  flat(F.col, rb.outline, { lw: 1.4 });
+  for (let i = 4; i <= 14; i++) for (const f of (i % 2 ? [.3, .7] : [.14, .5, .86])) dotp(rb.L[i][0] + (rb.R[i][0] - rb.L[i][0]) * f, rb.L[i][1] + (rb.R[i][1] - rb.L[i][1]) * f, L * .028, F.mark);
+  flat('#A9C08F', rb.L.slice(0, 5).concat(rb.R.slice(0, 5).reverse()), { grain: false, line: false });
+  pen('#F4F3EE', 1.8, 'pen'); brush.line(rb.L[4][0], rb.L[4][1], rb.R[4][0], rb.R[4][1]);
+  const ex = body[2][0] + L * .02, ey = -L * .03, r = L * .085; dotp(ex, ey, r, INK); dotp(ex, ey, r * .78, '#F1F1EC'); dotp(ex, ey, r * .5, INK);
+}
+function paintTurtle() {                                   // origin at the shell centre, facing right
+  for (const f of [[-38, -26, -65, 30], [-36, 18, 195, 32], [30, -26, -15, 30], [32, 20, 15, 30]]) { const a = f[2] * DEG, L = f[3], c = Math.cos(a), s = Math.sin(a), pts = [[0, -6], [.5 * L, -5], [.8 * L, -11], [.8 * L, -3], [L, 0], [.8 * L, 3], [.8 * L, 11], [.5 * L, 5], [0, 6]].map(p => [f[0] + p[0] * c - p[1] * s, f[1] + p[0] * s + p[1] * c]); flat('#8FA873', pts, { grain: false, lw: 1.1 }); }
+  flat('#A9C08F', ell(-44, 6, 14, 13), { lw: 1.1 });
+  flat(INK, ell(0, 0, 38, 37, 18), { lw: 1.2 }); const r = rng(81); for (let i = 0; i < 40; i++) { const a = r() * TAU, d = Math.sqrt(r()) * 31; dotp(Math.cos(a) * d, Math.sin(a) * d, 2.4, '#F2F2EE'); }
+  flat('#A9C08F', ell(48, -22, 18, 17), { lw: 1.2 }); for (const e of [[44, -29], [53, -15]]) { dotp(e[0], e[1], 7, INK); dotp(e[0], e[1], 5.4, '#F1F1EC'); dotp(e[0], e[1], 3.2, INK); }
+}
+
+/* ───── leaves, ripples ───── */
+const FALL = []; { const r = rng(999); for (let i = 0; i < 30; i++) { const x = 60 + r() * 650, dry = i % 3 === 0; FALL.push({ x, y: 130 + r() * 290, gy: dry ? bankY(x) + 10 + r() * (850 - bankY(x) - 22) : surfY(x) + 3, wet: !dry, t0: i < 22 ? 8.9 + r() * 2.6 : r() * 24, dur: 8 + r() * 3, sw: 14 + r() * 22, sp: r() * TAU, tilt: (r() - .5) * 1.5 + (r() < .5 ? 0 : PI), rest: (r() - .5) * .5, l: 17 + r() * 6 }); } }
+const LEAF_COLS = [[244, 246, 241], [169, 199, 122], [224, 162, 28], [181, 86, 43]];
+function leafCol(k) { const x = Math.min(.999, Math.max(0, k)) * 3, i = Math.floor(x), f = x - i, a = LEAF_COLS[i], b = LEAF_COLS[i + 1]; return color(a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f, a[2] + (b[2] - a[2]) * f); }
+function drawFalling(t) {
+  if (reducedMotion) return;
+  for (const f of FALL) {
+    const u = (((t - f.t0) % LOOP + LOOP) % LOOP) / f.dur; if (u >= 1) continue;
+    const fall = Math.min(1, u / .55), land = ease(Math.max(0, (fall - .82) / .18)), after = Math.max(0, (u - .55) / .45), melt = f.wet ? Math.min(1, after / .5) : 0;
+    const alpha = Math.min(1, u / .05) * (f.wet ? 1 - melt : Math.min(1, (1 - u) / .1)); if (alpha <= .01) continue;
+    const y = f.y + (f.gy - f.y) * (.75 * fall + .25 * fall * fall), x = f.x + Math.sin(fall * 6 + f.sp) * f.sw * (1 - land), a = (f.tilt + Math.sin(fall * 11 + f.sp) * .5) * (1 - land) + f.rest * land, l = f.l;
+    push(); translate(x, y); rotate(a); if (melt) scale(1 - melt * .45);
+    const c = leafCol(fall * .95); c.setAlpha(255 * alpha); fill(c); stroke(4, 1, 2, 255 * alpha); strokeWeight(1.2);
+    beginShape(); for (let q = 0; q <= 8; q++) vertex(l * q / 8, 6.2 * Math.sin(PI * q / 8)); for (let q = 8; q >= 0; q--) vertex(l * q / 8, -6.2 * Math.sin(PI * q / 8)); endShape(CLOSE);
+    strokeWeight(.8); line(1, 0, l * .86, 0); pop();
+  }
+}
+function drawRipples(t) {
+  if (reducedMotion) return; noFill();
+  for (const K in DEER) { const m = DEER[K].muzzle; if (!m || m[1] < surfY(m[0]) - 2) continue; const e = Math.min(1, (m[1] - surfY(m[0]) + 2) / 8), cx = m[0] + 4, cy = surfY(cx) + 5;
+    for (let k = 0; k < 5; k++) { const p = ((t * .42 + k / 5) % 1), rx = 10 + p * 90; stroke(226 - 196 * p, 242 - 178 * p, 248 - 78 * p, 255 * Math.pow(1 - p, .7) * e); strokeWeight(3.2 - 2 * p); ellipse(cx, cy, rx * 2, rx * .52); } }
+}
+
+/* ───── p5 lifecycle ───── */
+function setup() {
+  const holder = document.getElementById('holder'), c = createCanvas(W, H, WEBGL); c.parent(holder); pixelDensity(Math.min(window.devicePixelRatio || 1, 2)); angleMode(DEGREES);
+  randomSeed(7); noiseSeed(7); brush.scaleBrushes(2.2);
+  fitCanvas(); window.addEventListener('resize', fitCanvas);
+  buildTree();
+  // the pieces that need several buffers are split into one job per buffer
+  jobQueue = [];
+  jobQueue.push(() => paintBuffer('paper', 0, 0, W, H, paintPaper), () => paintBuffer('grass', 0, 740, W, 170, paintGrass), () => paintBuffer('tree', 0, 0, W, 870, paintTree), () => paintBuffer('water', 0, 826, W, H - 826, paintWater), () => paintBuffer('weeds', 0, 826, W, H - 826, paintWeeds));
+  for (const K in DEER) { const D = DEER[K]; jobQueue.push(() => paintBuffer('body' + K, Math.min(D.x - 30 * D.s * D.f, D.x + 290 * D.s * D.f) - 20, D.y - 190 * D.s - 20, 320 * D.s + 40, 200 * D.s + 40, g => { g.translate(D.x, D.y); g.scale(D.s * D.f, D.s); paintDeerBody(D); })); jobQueue.push(() => paintBuffer('head' + K, 330, 350, 230, 170, () => paintHead(D))); }
+  TREE_BIRDS.forEach((b, i) => jobQueue.push(() => paintBuffer('tb' + i, -b.s * 1.1, -b.s * .9, b.s * 2.1, b.s * 1.5, () => paintBlackBird(b))));
+  SMALL_BIRDS.forEach((b, i) => jobQueue.push(() => paintBuffer('sb' + i, -110, -150, 170, 160, () => paintSmallBird(b))));
+  FISH.forEach((F, i) => jobQueue.push(() => paintBuffer('fish' + i, -F.len * .7, -F.len * .4, F.len * 1.3, F.len * .8, () => paintFish(F))));
+  jobQueue.push(() => paintBuffer('turtle', -80, -50, 160, 100, paintTurtle));
+  jobTotal = jobQueue.length;
+  document.getElementById('play').addEventListener('click', e => { playing = !playing; e.target.textContent = playing ? 'Pause' : 'Play'; });
+  document.getElementById('still').addEventListener('click', e => { reducedMotion = !reducedMotion; e.target.setAttribute('aria-pressed', String(reducedMotion)); });
+}
+let ready = false, jobQueue = [], jobTotal = 1;
+function fitCanvas() { const availW = window.innerWidth - 20, availH = window.innerHeight - 64, cssW = Math.max(160, Math.min(availW, availH * W / H)); const el = document.querySelector('#holder canvas'); if (el) { el.style.width = cssW + 'px'; el.style.height = (cssW * H / W) + 'px'; } }
+function draw() {
+  const now = millis() / 1000; let dt = now - last; last = now; if (!(dt > 0) || dt > .1) dt = 1 / 60;
+  if (playing && !reducedMotion) T = (T + dt) % LOOP;
+  background(28, 21, 18);
+  if (!ready) {                                            // one painting job per frame: brush, flush, copy out
+    finishBuffer();
+    if (jobQueue.length) { jobQueue.shift()(); document.getElementById('status').textContent = 'painting… ' + Math.round((1 - jobQueue.length / jobTotal) * 100) + '%'; }
+    else if (!pending) { ready = true; document.getElementById('status').textContent = ''; }
+    return;
+  }
+  push(); translate(-W / 2, -H / 2); angleMode(RADIANS); imageMode(CORNER);
+  const t = reducedMotion ? 0 : T, sway = swayAt(t);
+  show('paper'); show('grass');
+  push(); translate(438, 822); rotate(sway); translate(-438, -822); show('tree'); pop();
+  show('water');
+  // swimmers behind the weeds
+  FISH.forEach((F, i) => { const a = TAU * t / F.per + F.ph, vx = Math.cos(a), face = reducedMotion ? 1 : Math.max(-1, Math.min(1, vx * 6)); push(); translate(F.cx + F.ax * Math.sin(a) * (reducedMotion ? 0 : 1), F.y + 6 * Math.sin(TAU * t / 6 + F.ph)); rotate(.12 * Math.sin(TAU * t / 6 + F.ph + 1.2) * face); scale(Math.abs(face) < .04 ? .04 : face, 1); const b = BUF['fish' + i]; image(b.g, b.x, b.y, b.w, b.h); pop(); });
+  { const a = TAU * t / 24 + 1, face = reducedMotion ? 1 : Math.max(-1, Math.min(1, Math.cos(a) * 6)); push(); translate(150 + 100 * Math.sin(a), 990 + 5 * Math.sin(TAU * t / 8)); rotate(.07 * Math.sin(TAU * t / 4) * face); scale(.7 * (Math.abs(face) < .04 ? .04 : face), .7); const b = BUF.turtle; image(b.g, b.x, b.y, b.w, b.h); pop(); }
+  push(); translate(384, H); rotate(.03 * Math.sin(TAU * t / 8)); translate(-384, -H); show('weeds'); pop();
+  drawDeer('A', t); drawDeer('B', t);
+  noStroke(); fill(40, 90, 190, 50); beginShape(); for (const p of waterPts()) vertex(p[0], p[1]); endShape(CLOSE);   // the water lies over what is in it
+  drawRipples(t);
+  SMALL_BIRDS.forEach((b, i) => {                          // the four coloured birds: riders follow their deer
+    let px = b.x, py = b.y; if (b.ride) { const D = DEER[b.ride]; if (D.rig) { const p = toC(D, D.rig.rot([b.lx, b.ly])); px = p[0]; py = p[1]; } }
+    if (b.sway) { px = b.x - sway * (b.y - 822); py = b.y + sway * (b.x - 438); }
+    const st = birdState({ x: px, y: py }, 6 + i, t), bf = BUF['sb' + i];
+    push(); translate(st.x, st.y); if (st.face ? st.face > 0 : b.flip) scale(-1, 1); rotate(st.rot); if (st.fly > 0) { push(); translate(0, -50); scale(-.75, .75); fanWing(60, b.col, b.wing, st.fly, t, i); pop(); } image(bf.g, bf.x, bf.y, bf.w, bf.h); pop();
+  });
+  TREE_BIRDS.forEach((b, i) => {
+    const hold = 1, st = birdState(b, i, t), fl = st.fly, px = st.x - sway * (st.y - 822) * (1 - fl), py = st.y + sway * (st.x - 438) * (1 - fl), bf = BUF['tb' + i];
+    push(); translate(px, py); scale(st.face || b.dir, 1); rotate(st.rot); if (fl > 0) fanWing(b.s, b.col, b.col2, fl, t, i); image(bf.g, bf.x, bf.y, bf.w, bf.h); pop();
+  });
+  drawFalling(t);
+  pop();
+}
+</script>
+</body>
+</html>
