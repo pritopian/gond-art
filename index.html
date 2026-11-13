@@ -360,27 +360,21 @@ function wipeClip(c) {                                     // everything left of
    The crumpled gold foil of Tanjore and Pichwai grounds: a field of small irregular facets, each catching the light a
    little differently, with fine bright and dark creases between them. Drawn once; laid over the paper at low opacity. */
 function drawFoil(c) {
-  const r = rng(4747), cell = 40, cols = Math.ceil(W / cell) + 2, rows = Math.ceil(H / cell) + 2, P = [];
-  for (let j = 0; j <= rows; j++) { P.push([]); for (let i = 0; i <= cols; i++) P[j].push([(i - 1) * cell + (r() - .5) * cell * .9, (j - 1) * cell + (r() - .5) * cell * .9]); }
-  const golds = ['#C9A227', '#D4AF37', '#E0BE4A', '#B8922A', '#EACB64', '#C49B2E'];
-  for (let j = 0; j < rows; j++) for (let i = 0; i < cols; i++) {
-    const a = P[j][i], b = P[j][i + 1], d = P[j + 1][i + 1], e = P[j + 1][i], m = [(a[0] + d[0]) / 2, (a[1] + d[1]) / 2];
-    // two triangles per cell, so each facet tilts its own way
-    for (const tri of [[a, b, m], [b, d, m], [d, e, m], [e, a, m]]) {
-      const g = c.createLinearGradient(tri[0][0], tri[0][1], tri[1][0], tri[1][1]);
-      const k = golds[(r() * golds.length) | 0], lum = .75 + r() * .5;
-      g.addColorStop(0, k); g.addColorStop(1, lum > 1 ? '#E6CC72' : '#B8922A');
-      c.beginPath(); c.moveTo(tri[0][0], tri[0][1]); c.lineTo(tri[1][0], tri[1][1]); c.lineTo(tri[2][0], tri[2][1]); c.closePath();
-      c.fillStyle = g; c.globalAlpha = .7 + r() * .3; c.fill();
-    }
+  // smooth gold: a warm base, then many large soft pools of lighter and deeper gold that melt into one another,
+  // like leaf that has been burnished flat, with a few faint glints. No creases or hard edges.
+  const r = rng(4747);
+  c.fillStyle = '#CFA93A'; c.fillRect(0, 0, W, H);
+  for (let i = 0; i < 160; i++) {
+    const x = r() * W, y = r() * H, rad = 70 + r() * 190, light = r() < .5;
+    const g = c.createRadialGradient(x, y, 0, x, y, rad), rgb = light ? '240,214,120' : '166,124,38';
+    g.addColorStop(0, `rgba(${rgb},${.35 + r() * .35})`); g.addColorStop(.6, `rgba(${rgb},${.12 + r() * .12})`); g.addColorStop(1, `rgba(${rgb},0)`);
+    c.fillStyle = g; c.fillRect(x - rad, y - rad, rad * 2, rad * 2);
   }
-  c.globalAlpha = 1; c.lineCap = 'round';
-  for (let j = 0; j < rows; j++) for (let i = 0; i < cols; i++) {                 // creases: a bright edge and a dark edge
-    const a = P[j][i], b = P[j][i + 1], e = P[j + 1][i];
-    if (r() < .45) { c.beginPath(); c.moveTo(a[0], a[1]); c.lineTo(b[0], b[1]); c.strokeStyle = r() < .5 ? 'rgba(255,240,190,.45)' : 'rgba(110,75,15,.3)'; c.lineWidth = .6 + r() * .7; c.stroke(); }
-    if (r() < .45) { c.beginPath(); c.moveTo(a[0], a[1]); c.lineTo(e[0], e[1]); c.strokeStyle = r() < .5 ? 'rgba(255,240,190,.4)' : 'rgba(110,75,15,.3)'; c.lineWidth = .6 + r() * .7; c.stroke(); }
+  for (let i = 0; i < 24; i++) {                            // broad, very soft sheens across the sheet
+    const x = r() * W, y = r() * H, rad = 220 + r() * 260, g = c.createRadialGradient(x, y, 0, x, y, rad);
+    g.addColorStop(0, 'rgba(255,236,160,.22)'); g.addColorStop(1, 'rgba(255,236,160,0)'); c.fillStyle = g; c.fillRect(x - rad, y - rad, rad * 2, rad * 2);
   }
-  for (let i = 0; i < 160; i++) dab(c, r() * W, r() * H, 1 + r() * 2.2, 'rgba(255,248,210,.7)');   // glints
+  for (let i = 0; i < 90; i++) { const x = r() * W, y = r() * H, rad = 2 + r() * 4, g = c.createRadialGradient(x, y, 0, x, y, rad); g.addColorStop(0, 'rgba(255,250,220,.55)'); g.addColorStop(1, 'rgba(255,250,220,0)'); c.fillStyle = g; c.fillRect(x - rad, y - rad, rad * 2, rad * 2); }
 }
 
 /* ───────────── paper ───────────── */
@@ -1608,7 +1602,7 @@ function ground(v) { const g = GROUND[v]; if (g) { ctx.fillStyle = `rgba(${g[0]}
 function render(t) {
   setWipe(t); SWAY = swayAt(t);
   blit('paper');
-  if (foilAmt > 0) { ctx.globalAlpha = .24 * foilAmt; blit('foil'); ctx.globalAlpha = 1; }   // subtle gold leaf behind everything
+  if (foilAmt > 0) { ctx.globalAlpha = .3 * foilAmt; blit('foil'); ctx.globalAlpha = 1; }   // subtle gold leaf behind everything
   blit('grass');                                           // first, so trunk and roots stand on it
   // the whole tree leans with the wind about its foot; fronds add their own flutter
   ctx.save(); ctx.translate(SWAY_BASE[0], SWAY_BASE[1]); ctx.rotate(SWAY); ctx.translate(-SWAY_BASE[0], -SWAY_BASE[1]);
