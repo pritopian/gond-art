@@ -55,7 +55,7 @@ const THEMES = {
     '#F2C4C0': '#F6DDB4', '#B83F56': '#E0622A', '#F6D7D2': '#FBEBD2', '#C2475A': '#D9561F', '#3F7A3A': '#1C6E8C', '#1C6E8C': '#C77A1C',
     '#8FA466': '#6E8F5A', '#2F5E2A': '#2A4A26', '#D9DDA2': '#C9D89A', '#F0D24A': '#F4C95C',
     '#1B3E9C': '#0F5C5A', '#2B5BC4': '#1F7F78', '#3F86D6': '#3FA797', '#16307E': '#0A3F42', '#7DB7E6': '#8FD1C3', '#1F3FA6': '#176463', '#0B1640': '#052A2A',
-    '#C2261E': '#D94F2B', '#E0622A': '#E0A21C', '#7A4424': '#5B4E3C' } },
+    '#C2261E': '#D94F2B', '#E0622A': '#E0A21C', '#1F6FA8': '#B83F56' } },
   dusk: { name: 'Dusk', map: {
     '#F5D3B2': '#EFC4B0', '#F9DBBC': '#F4D4C2', '#DEBE9D': '#D4A892',
     '#4A2513': '#1A1210', '#5A2C16': '#221714', '#7A4424': '#3A2622', '#3F6B34': '#5A2A3C', '#F1E4C8': '#F3E3D2',
@@ -887,8 +887,8 @@ function drawWipeEdge(c) {                                 // the repainting fro
 
 /* ───────────── small golden-and-maroon birds ───────────── */
 const SMALL_BIRDS = [
-  { x: 0, y: 0, ride: { deer: 'A', lx: 86, ly: -170 }, s: .8, flip: false, rot: -55, beak: -10, ph: .4 },   // rides the golden deer's rump
-  { x: 0, y: 0, ride: { deer: 'B', lx: 206, ly: -172 }, s: .8, flip: false, rot: -55, beak: -10, ph: 2.6 },    // rides the striped deer's rump
+  { x: 0, y: 0, ride: { deer: 'A', lx: 86, ly: -170 }, col: '#1F6FA8', wing: '#C2475A', s: .8, flip: false, rot: -55, beak: -10, ph: .4 },   // rides the golden deer's rump
+  { x: 0, y: 0, ride: { deer: 'B', lx: 206, ly: -172 }, col: '#3F7A3A', wing: '#E0A21C', s: .8, flip: false, rot: -55, beak: -10, ph: 2.6 },    // rides the striped deer's rump
   { x: 54, y: 733, s: .8, flip: false, rot: -55, beak: -10, ph: 4.1 },                                         // on the bank, far left, clear of the drinking head
   { x: 686, y: 491, s: .8, flip: true, rot: -55, beak: -10, ph: 5.5, sway: true }                               // on the low drooping limb
 ].map((b, i) => { const p = q1(b.x, b.y); return { ...b, x: p[0], y: p[1], rot: b.rot * DEG, beak: b.beak * DEG, seed: 400 + i }; });
@@ -909,9 +909,9 @@ function gondBird(c, b, t) {
   }
   if (st.face ? st.face < 0 : b.flip) c.scale(-1, 1);
   c.rotate(st.rot); c.scale(b.s, b.s);
-  shape(c, [[-2, 12], [-28, 24], [-58, 18], [-84, -2], [-93, -13], [-66, 3], [-34, 8], [-10, 0]], { fill: pal.bGold, rings: R_BIRD, stroke: C.ink, lw: 1.5, seed: b.seed });
+  shape(c, [[-2, 12], [-28, 24], [-58, 18], [-84, -2], [-93, -13], [-66, 3], [-34, 8], [-10, 0]], { fill: b.col || pal.bGold, rings: R_BIRD, stroke: C.ink, lw: 1.5, seed: b.seed });
   c.beginPath(); c.moveTo(-5, -3); c.quadraticCurveTo(-36, -46, -80, -9); c.quadraticCurveTo(-40, 15, -5, -3); c.closePath();
-  c.fillStyle = pal.bWing; c.fill();
+  c.fillStyle = b.wing || pal.bWing; c.fill();
   c.save(); c.clip(); c.strokeStyle = '#1D0509'; c.lineWidth = .95; c.beginPath();
   for (let i = 0; i <= 13; i++) {
     const u = i / 13, m = 1 - u, mx = m * m * -5 + 2 * m * u * -42 + u * u * -80, my = m * m * -3 + 2 * m * u * -15 + u * u * -9;
@@ -928,7 +928,7 @@ function gondBird(c, b, t) {
         const L = (54 - 6 * Math.abs(k - 1.5)) * st.fly;
         c.save(); c.rotate((k - 1.5) * (.21 + .05 * beat) * st.fly);
         c.beginPath(); c.moveTo(0, 0); c.quadraticCurveTo(L * .5, -8, L, 0); c.quadraticCurveTo(L * .5, 8, 0, 0); c.closePath();
-        c.fillStyle = k % 2 ? pal.bGold : pal.bWing; c.fill(); c.strokeStyle = C.ink; c.lineWidth = 1.2; c.lineJoin = 'round'; c.stroke();
+        c.fillStyle = k % 2 ? (b.col || pal.bGold) : (b.wing || pal.bWing); c.fill(); c.strokeStyle = C.ink; c.lineWidth = 1.2; c.lineJoin = 'round'; c.stroke();
         c.lineWidth = .8; c.beginPath(); c.moveTo(L * .2, 0); c.lineTo(L * .85, 0); c.stroke();
         c.restore();
       }
@@ -936,7 +936,7 @@ function gondBird(c, b, t) {
     }
   }
   c.save(); c.rotate(b.beak * (1 - st.fly)); c.beginPath(); poly(c, [[11, -6], [29, -1], [11, 6]]); c.fillStyle = '#3A1E12'; c.fill(); c.strokeStyle = C.ink; c.lineWidth = 1.2; c.stroke(); c.restore();
-  shape(c, blob(0, 0, 15, 14.5, 0, rng(b.seed), .03, 10), { fill: pal.bGold, rings: R_BIRD, stroke: C.ink, lw: 1.5, seed: b.seed + 1 });
+  shape(c, blob(0, 0, 15, 14.5, 0, rng(b.seed), .03, 10), { fill: b.col || pal.bGold, rings: R_BIRD, stroke: C.ink, lw: 1.5, seed: b.seed + 1 });
   eyeRing(c, 1, -1, 8, 0, C.ochre);
   c.restore();
 }
